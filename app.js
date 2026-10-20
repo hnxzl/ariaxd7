@@ -1,17 +1,21 @@
-/* ═══════════════════════════════════════════
- Aria XD7 Configuration Logic
- ═══════════════════════════════════════════ */
 
-// Report IDs observed in real traffic (sniffer log):
-//   OUT -> mouse : report 0x08, 15 data bytes
-//   IN  <- mouse : report 0x09, 16 data bytes
 const VENDOR_ID = 0x25a7,
-  PRODUCT_IDS = [0xfa7b, 0xfa7c],
+  PID_CABLE = 0xfa7b,
+  PID_DONGLE = 0xfa7c,
+  PID_BLUETOOTH = 0xfa6c,
+  PRODUCT_IDS = [PID_CABLE, PID_DONGLE, PID_BLUETOOTH],
   REPORT_OUT = 0x08,
   REPORT_IN = 0x09;
 
-// Config memory map (little, 0x0000-based). Verified against sniffer dump.
-// Every field is followed by a checksum byte: 0x55 - sum(previous bytes).
+const T = (key, vars) => {
+  if (window.I18n) return window.I18n.t(key, vars);
+  let out = String(key);
+  if (vars) out = out.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+  return out;
+};
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+
 const REG = {
   POLLING: 0x00, // 1=1000Hz 2=500 4=250 8=125
   STAGES: 0x02, // 1..7
@@ -27,24 +31,19 @@ const REG = {
 };
 const SLEEP_VALUES = [1, 2, 3, 6, 12, 30, 60];
 const MEM_BASE = 0x0000;
-const MEM_SIZE = 0x0200;
+const MEM_SIZE = 0x2000;
 
-// ═══ Button remapping ═══
-// Reverse-engineered from the official driver (Aria_KV__XD7 V1.2) and
-// verified against the mouse's own memory:
-//   key table   0x60 + i*4      : b0 b1 b2 chk
-//   key data    0x100 + i*0x20  : count, count×(op, lo, hi), chk
-// i is the physical button index below.
+
 const BTN_TABLE = 0x60;
 const BTN_DATA = 0x100;
 const BUTTON_SLOTS = [
-  // anchor = point on button.png (percent), label = where the pill sits
   { idx: 0, name: "Left Click", anchor: [40, 63], label: [3, 90], side: "l" },
   { idx: 1, name: "Right Click", anchor: [25, 41], label: [3, 13], side: "l" },
   { idx: 2, name: "Wheel Click", anchor: [29, 51], label: [3, 30], side: "l" },
   { idx: 3, name: "Back", anchor: [71, 51], label: [97, 78], side: "r" },
   { idx: 4, name: "Forward", anchor: [57, 60], label: [97, 92], side: "r" },
-  { idx: 5, name: "DPI Button", anchor: [50, 32], label: [97, 13], side: "r" },
+
+  { idx: 5, name: "DPI Button", under: true, anchor: [41, 79], label: [41, 93], side: "b" },
 ];
 const DEFAULT_BUTTONS = [
   { t: "mouse", v: "left" },
@@ -63,8 +62,8 @@ const MOUSE_NAMES = {
   forward: "Forward",
 };
 const DPI_FN = { loop: 0x01, up: 0x02, down: 0x03 };
+const WHEEL_NAMES = { up: "Wheel Up", down: "Wheel Down", left: "Tilt Left", right: "Tilt Right" };
 const DPI_NAMES = { loop: "DPI Loop", up: "DPI +", down: "DPI −" };
-// HID consumer usages, same list and order as the official driver.
 const MEDIA_KEYS = [
   [0xcd, "Play / Pause"],
   [0xb7, "Stop"],
@@ -146,14 +145,20 @@ const ButtonCodec = {
       }
       case "rgb":
         return { entry: [a.v === "cycle" ? 0x07 : 0x08, 0x00, 0x00] };
+      case "wheel":
+        // 0x0b = vertical wheel step, 0x03 = horizontal (tilt) — CompX enum
+        return {
+          entry: a.v === "left" || a.v === "right"
+            ? [0x03, a.v === "left" ? 1 : 2, 0x00]
+            : [0x0b, a.v === "down" ? 2 : 1, 0x00],
+        };
       case "media": {
         const lo = a.usage & 0xff,
           hi = (a.usage >> 8) & 0xff;
         return { entry: [0x05, 0, 0], block: [2, 0x82, lo, hi, 0x42, lo, hi] };
       }
       case "key": {
-        // Same event order as the official driver: press modifiers, press
-        // key, release modifiers, release key.
+    
         const ev = [];
         for (const bit of [1, 2, 4, 8]) if (a.mods & bit) ev.push([0x80, bit, 0]);
         if (a.key) ev.push([0x81, a.key, 0]);
@@ -170,7 +175,6 @@ const ButtonCodec = {
     }
   },
 
-  // device bytes -> action. block = bytes at BTN_DATA + i*0x20 (or null)
   decode(e, block) {
     const [b0, b1, b2] = e;
     if (b0 === 0x00) return { t: "off" };
@@ -186,6 +190,8 @@ const ButtonCodec = {
       if (b1 === 0x32 && (b2 === 2 || b2 === 3)) return { t: "click", n: b2 };
       return { t: "fire", speed: b1, times: b2 };
     }
+    if (b0 === 0x03 && (b1 === 1 || b1 === 2)) return { t: "wheel", v: b1 === 1 ? "left" : "right" };
+    if (b0 === 0x0b && (b1 === 1 || b1 === 2)) return { t: "wheel", v: b1 === 1 ? "up" : "down" };
     if (b0 === 0x07) return { t: "rgb", v: "cycle" };
     if (b0 === 0x08) return { t: "rgb", v: "toggle" };
     if (b0 === 0x0a) return { t: "dpiLock", dpi: (b1 + 1) * 50 };
@@ -210,19 +216,19 @@ const ButtonCodec = {
   label(a) {
     switch (a?.t) {
       case "mouse":
-        return MOUSE_NAMES[a.v] || "Mouse";
+        return T(MOUSE_NAMES[a.v] || "Mouse");
       case "click":
-        return a.n === 3 ? "Triple Click" : "Double Click";
+        return T(a.n === 3 ? "Triple Click" : "Double Click");
       case "fire":
-        return "Fire Key";
+        return T("Fire Key");
       case "dpi":
-        return DPI_NAMES[a.v] || "DPI";
+        return T(DPI_NAMES[a.v] || "DPI");
       case "dpiLock":
-        return "DPI Lock " + a.dpi;
+        return T("DPI Lock") + " " + a.dpi;
       case "rgb":
-        return a.v === "cycle" ? "LED Mode Switch" : "LED On / Off";
+        return T(a.v === "cycle" ? "LED Mode Switch" : "LED On / Off");
       case "media":
-        return MEDIA_KEYS.find(([u]) => u === a.usage)?.[1] || "Media";
+        return T(MEDIA_KEYS.find(([u]) => u === a.usage)?.[1] || "Media");
       case "key": {
         const parts = [];
         if (a.mods & 1) parts.push("Ctrl");
@@ -230,14 +236,16 @@ const ButtonCodec = {
         if (a.mods & 4) parts.push("Alt");
         if (a.mods & 8) parts.push("Win");
         if (a.key) parts.push(HID_KEY_NAMES[a.key] || "Key " + a.key);
-        return parts.join(" + ") || "Keyboard";
+        return parts.join(" + ") || T("Keyboard");
       }
+      case "wheel":
+        return T(WHEEL_NAMES[a.v] || "Wheel");
       case "macro":
-        return "Macro";
+        return T("Macro") + " " + ((a.bytes?.[1] ?? 0) + 1);
       case "off":
-        return "Disabled";
+        return T("Disabled");
       default:
-        return "Custom";
+        return T("Custom");
     }
   },
 
@@ -250,11 +258,9 @@ class AriaHID {
   constructor() {
     this.device = null;
     this.debug = true;
-    // Preferred vendor interface usagePage.
-    // Some firmware exposes 0xff01..0xff04 instead of exactly 0xff00.
+
     this.preferredUsagePage = 0xff00;
     this.allowVendorUsageFallback = true;
-    // Direct Memory Read model (base 0x0000 .. 0x00ff)
     this._memBase = MEM_BASE;
     this._mem = new Uint8Array(MEM_SIZE);
     this._pendingRead = new Map();
@@ -263,19 +269,57 @@ class AriaHID {
     this._featureReportIds = new Set();
     this._outputReportIds = new Set();
 
-    // Direct-read capability detection
     this.readbackSupported = null; // null=unknown, true/false after probe
     this._sawReadData = false;
     this._warnedReadback = false;
 
+    this.transport = null;
+    this._timeoutScale = 1;
+    this.candidates = []; // every device the browser offered, for Diagnostics
+    this.lastReadback = null; // { addr, ok, sent, read } of the last verify
+    this.lastBatteryAt = null;
+    this._macroBusy = false;
+
     this._resetIO();
+  }
+
+  _t(ms) {
+    return Math.round(ms * this._timeoutScale);
+  }
+
+  _hasReport(dev, kind, id) {
+    return (dev?.collections || []).some((c) =>
+      (c[kind] || []).some((r) => r.reportId === id),
+    );
+  }
+
+  _guessTransport(dev) {
+    if (!dev) return null;
+    if (dev.productId === PID_BLUETOOTH) return "bluetooth";
+    const name = (dev.productName || "").toLowerCase();
+    if (/bluetooth|\bbt\b|\bble\b/.test(name)) return "bluetooth";
+    if (this._hasReport(dev, "featureReports", REPORT_OUT)) return "usb";
+    if (this._hasReport(dev, "outputReports", REPORT_OUT)) return "bluetooth";
+    return "usb";
+  }
+
+
+  get link() {
+    if (!this.device) return null;
+    if (this.transport === "bluetooth") return "bluetooth";
+    if (this.device.productId === PID_DONGLE) return "dongle";
+    if (this.device.productId === PID_CABLE) return "cable";
+    return "usb";
+  }
+
+  get transportLabel() {
+    return { bluetooth: "Bluetooth", dongle: T("2.4G receiver"), cable: T("USB cable"), usb: "USB" }[this.link] || "—";
   }
 
   _resetIO() {
     this._queue = Promise.resolve();
     this._queueDepth = 0;
-    // register -> { len, data, promise } for writes not yet on the wire;
-    // a newer value for the same register replaces the queued one.
+
     this._pendingWrites = new Map();
     this._pendingAck = null;
     this._writeGen = 0;
@@ -292,7 +336,14 @@ class AriaHID {
     }
   }
 
+  _wire(dir, id, bytes) {
+    const log = (this.wireLog = this.wireLog || []);
+    log.push(`${new Date().toISOString().slice(11, 23)} ${dir} ${id != null ? "id=0x" + id.toString(16) + " " : ""}${this._hex(bytes || [])}`);
+    if (log.length > 60) log.shift();
+  }
+
   _logTx(label, bytes) {
+    this._wire("TX " + (this._outMode || "?"), REPORT_OUT, bytes);
     if (!this.debug) return;
     console.debug(
       "[ARIA] TX",
@@ -303,6 +354,7 @@ class AriaHID {
   }
 
   _logRx(reportId, bytes) {
+    this._wire("RX", reportId, bytes);
     if (!this.debug) return;
     console.debug(
       "[ARIA] RX",
@@ -358,14 +410,24 @@ class AriaHID {
     this.readbackSupported = null;
     this.device = device;
     this._outMode = null;
+    this.lastReadback = null;
+    this.transport = this._guessTransport(device);
+    this._timeoutScale = this.transport === "bluetooth" ? 2.5 : 1;
+    this._reconnectTries = 0;
+    if (this.debug)
+      console.debug(
+        "[ARIA] connected",
+        "pid=0x" + device.productId.toString(16),
+        "name=" + device.productName,
+        "transport=" + this.transport,
+      );
     app.btnConnecting();
     try {
       if (!device.opened) await device.open();
     } catch (e) {
       app.pairFailed();
       if (AriaHID.isLinux()) {
-        // Linux: /dev/hidraw* is root-only by default, so Chrome cannot
-        // open it until a udev rule grants the logged-in user access.
+   
         console.error(
           "[ARIA] open() failed on Linux — install the udev rule:\n" +
             "  sudo cp linux/70-fantech-aria-xd7.rules /etc/udev/rules.d/\n" +
@@ -383,15 +445,15 @@ class AriaHID {
 
     this.discoverReports();
 
-    // WebHID portability note:
-    // Chrome/macOS + Linux + Windows all use the same HID frames.
-    // The USB product swaps between 0xfa7b/0xfa7c on mode change (wired/
-    // 2.4G/BT), which is why both PIDs are in the pair filter. No
-    // special-casing per OS — one protocol, one code path.
-    device.addEventListener("inputreport", (e) => this.onInputReport(e));
 
-    // Unstick UI: as soon as device is opened, show settings panels.
-    // State will be updated as soon as reads come back.
+    this._listening = this._listening || new WeakSet();
+    if (!this._listening.has(device)) {
+      this._listening.add(device);
+      device.addEventListener("inputreport", (e) => {
+        if (e.device === this.device || e.target === this.device) this.onInputReport(e);
+      });
+    }
+
     try {
       app.onConnected();
       app.syncUIFromState();
@@ -408,22 +470,17 @@ class AriaHID {
 
   getVendorInterface(devices) {
     if (!devices || !devices.length) return null;
-    // Vendor 0x25a7 covers wired / 2.4G dongle / BT — the productId
-    // changes per transport, so match on VID first.
+
     const valid = devices.filter((d) => d.vendorId === VENDOR_ID);
     if (!valid.length) return null;
     const hasPage = (d, pred) => (d.collections || []).some(pred);
     const hasReport = (d, kind, id) =>
       hasPage(d, (c) => (c[kind] || []).some((r) => r.reportId === id));
 
-    // 1) Prefer known productIds
     const known = valid.filter((d) => PRODUCT_IDS.includes(d.productId));
     const pool = known.length ? known : valid;
 
-    // 2) Prefer the interface that actually carries the config reports
-    //    (feature 0x08 OUT + input 0x09 IN). On Windows Chrome may merge
-    //    or split collections differently than on Linux/macOS, so match
-    //    on the reports themselves rather than on interface order.
+
     const byReports = pool.find(
       (d) =>
         hasReport(d, "featureReports", REPORT_OUT) ||
@@ -433,13 +490,11 @@ class AriaHID {
     const byInput = pool.find((d) => hasReport(d, "inputReports", REPORT_IN));
     if (byInput) return byInput;
 
-    // 3) Prefer exact 0xff00
     const exact = pool.find((d) =>
       hasPage(d, (c) => c.usagePage === this.preferredUsagePage),
     );
     if (exact) return exact;
 
-    // 4) Fallback: any vendor-defined usagePage range 0xff00..0xffff
     if (this.allowVendorUsageFallback) {
       const vendor = pool.find((d) =>
         hasPage(d, (c) => (c.usagePage & 0xffff) >= 0xff00),
@@ -447,9 +502,6 @@ class AriaHID {
       if (vendor) return vendor;
     }
 
-    // No vendor interface visible. Do NOT fall back to the plain mouse
-    // interface: Chrome hides its (protected) collections, so writes
-    // would silently go nowhere.
     return null;
   }
 
@@ -459,12 +511,44 @@ class AriaHID {
     return /linux/i.test(p) && !/android/i.test(navigator.userAgent);
   }
 
-  async pair() {
+  _rankDevice(d) {
+    let s = 0;
+    if (d.vendorId === VENDOR_ID) s += 8;
+    if (PRODUCT_IDS.includes(d.productId)) s += 4;
+    if ((d.collections || []).some((c) => c.usagePage === 0xff00)) s += 16;
+    else if ((d.collections || []).some((c) => (c.usagePage & 0xffff) >= 0xff00)) s += 10;
+    if (this._hasReport(d, "featureReports", REPORT_OUT)) s += 6;
+    if (this._hasReport(d, "outputReports", REPORT_OUT)) s += 5;
+    if (this._hasReport(d, "inputReports", REPORT_IN)) s += 3;
+    return s;
+  }
+
+  _rememberCandidates(devices) {
+    this.candidates = (devices || [])
+      .map((d) => ({
+        device: d,
+        score: this._rankDevice(d),
+        name: d.productName || "(unnamed)",
+        vid: d.vendorId,
+        pid: d.productId,
+        pages: (d.collections || []).map((c) => c.usagePage),
+        transport: this._guessTransport(d),
+      }))
+      .sort((a, b) => b.score - a.score);
+  }
+
+
+  async pair({ all = false } = {}) {
     try {
       // Vendor-only filter so wired, dongle and Bluetooth all show up.
       const devices = await navigator.hid.requestDevice({
-        filters: [{ vendorId: VENDOR_ID }],
+        filters: all ? [] : [{ vendorId: VENDOR_ID }],
       });
+      if (!devices || !devices.length) {
+        app.pairFailed();
+        return;
+      }
+      this._rememberCandidates(devices);
 
       if (this.debug) {
         for (const d of devices || []) {
@@ -480,18 +564,27 @@ class AriaHID {
 
       const target = this.getVendorInterface(devices);
       if (target) await this.connect(target);
-      else {
+      else if (devices.some((d) => this._guessTransport(d) === "bluetooth")) {
+   
+        app.pairFailed();
+        app.showBluetoothLimit();
+        return;
+      } else {
         const pages = (devices || [])
           .flatMap((d) => (d.collections || []).map((c) => c.usagePage))
           .filter((v) => typeof v === "number");
         throw new Error(
-          "No Aria XD7 interface found. Detected usagePages: " +
-            (pages.length ? pages.join(",") : "(none)"),
+          T("No usable Aria XD7 interface. Detected usagePages: {pages}", {
+            pages: pages.length
+              ? pages.map((p) => "0x" + p.toString(16)).join(", ")
+              : "(none)",
+          }),
         );
       }
     } catch (e) {
       app.pairFailed();
       if (e && e._ariaHandled) return;
+      if (e?.name === "NotFoundError") return; // chooser closed
       app.toast(
         e && e.message ? e.message : "Pair/connect failed",
         "error",
@@ -501,8 +594,25 @@ class AriaHID {
 
   async autoConnect() {
     const devices = await navigator.hid.getDevices();
+    if (!this.candidates.length) this._rememberCandidates(devices);
     const target = this.getVendorInterface(devices);
     if (target) await this.connect(target);
+    return !!target;
+  }
+
+
+  scheduleReconnect() {
+    if (this.transport !== "bluetooth") return;
+    clearTimeout(this._reconnectTimer);
+    const tick = async () => {
+      if (this.connected) return;
+      if ((this._reconnectTries = (this._reconnectTries || 0) + 1) > 6) return;
+      try {
+        if (await this.autoConnect()) return;
+      } catch {}
+      this._reconnectTimer = setTimeout(tick, 3000);
+    };
+    this._reconnectTimer = setTimeout(tick, 3000);
   }
 
   // === Packet Helpers ===
@@ -557,7 +667,6 @@ class AriaHID {
       const idx = start + i;
       if (idx >= 0 && idx < this._mem.length) this._mem[idx] = bytes[i];
     }
-    // ponytail: checksum validation removed for brevity, add when strict mode needed
   }
 
   _memReadU8(address16) {
@@ -586,18 +695,15 @@ class AriaHID {
       console.warn("[ARIA] wakeup failed:", e);
     }
 
-    // Light the UI right away so the panels are usable.
     try {
       app.onConnected();
       app.syncUIFromState();
     } catch {}
 
-    // 2) Battery first so the ring fills in immediately.
     this.requestBattery().catch(() => {});
     this._startBatteryPoll();
 
-    // Probe once: many Aria XD7 firmwares ACK reads but never return data
-    // (read-protected).
+
     if (this.readbackSupported === null) {
       try {
         await this._probeDirectRead();
@@ -605,9 +711,12 @@ class AriaHID {
     }
 
     if (this.readbackSupported === false) {
-      // Usually a wireless mouse that is asleep. Keep the UI usable and
-      // let the periodic sync pick the settings up once it wakes.
-      app.toast("Mouse not responding — move it to wake it up", "error");
+      app.toast(
+        this.transport === "bluetooth"
+          ? "Bluetooth connected, but the mouse does not answer config requests — open Diagnostics"
+          : "Mouse not responding — move it to wake it up",
+        "error",
+      );
       this._startDeviceSync();
       return;
     }
@@ -622,8 +731,7 @@ class AriaHID {
     this._startDeviceSync();
   }
 
-  // Resolve as soon as the first passive memory frame lands, or after
-  // `timeout` ms. The dump itself keeps flowing afterwards.
+
   _waitForPassiveDump(timeout) {
     return new Promise((resolve) => {
       if (this._mem[MEM_BASE] !== 0xff) return resolve();
@@ -637,8 +745,7 @@ class AriaHID {
     });
   }
 
-  // Battery: cmd 0x04 (no data) is answered right away with
-  //   04 00 00 00 02 <pct> ...   (verified on hardware, 0x5a = 90%)
+
   _startBatteryPoll() {
     if (this._battTimer) return;
     this._battTimer = setInterval(() => {
@@ -662,16 +769,11 @@ class AriaHID {
     this._battTimer = this._syncTimer = null;
   }
 
-  // The DPI button on the mouse can change settings behind our back, so
-  // re-read periodically. A read cycle must never overwrite something the
-  // user just changed: skip while they are interacting, while writes are
-  // queued, and throw the result away if any write landed mid-cycle.
   _startDeviceSync() {
     if (this._syncTimer) return;
     this._syncTimer = setInterval(() => this._syncTick(), 4000);
     if (!this._visBound) {
       this._visBound = true;
-      // Timers are paused while the tab is hidden; catch up on return.
       document.addEventListener("visibilitychange", () => {
         if (document.hidden || !this.connected) return;
         this.requestBattery().catch(() => {});
@@ -682,7 +784,7 @@ class AriaHID {
 
   async _syncTick() {
     if (!this.connected) return this._stopTimers();
-    if (this._syncing || document.hidden) return;
+    if (this._syncing || this._macroBusy || document.hidden) return;
     if (this._queueDepth || this._pendingWrites.size) return;
     if (app.isUserBusy()) return;
     this._syncing = true;
@@ -693,15 +795,11 @@ class AriaHID {
       if (app.isUserBusy()) return;
       this.applyMemoryToState();
     } catch {
-      // mouse asleep / out of range: try again next tick
     } finally {
       this._syncing = false;
     }
   }
 
-  // === Command queue ===
-  // All traffic to the mouse goes through one serial queue so a read
-  // cycle and a write can never interleave on the wire.
   _enqueue(job) {
     this._queueDepth++;
     const run = this._queue.then(job);
@@ -709,33 +807,51 @@ class AriaHID {
     return run;
   }
 
-  // cmd 0x02 with data [0x01] only ACKs; the percentage rides along as the
-  // passive 04 frame at the end of the wakeup dump.
+
   buildBatteryRequest() {
     return this._frame(0x02, 0x0000, 1, Uint8Array.from([0x01]));
   }
 
-  async _probeDirectRead() {
-    this._sawReadData = false;
-    try {
-      // Quick probe: if it can't read even 1 byte, assume readback unsupported.
-      await this._enqueue(() => this._readChunk(MEM_BASE, 1, 600));
-      this.readbackSupported = true;
-    } catch {
-      this.readbackSupported = this._sawReadData ? true : false;
-    }
-    if (this.debug)
-      console.debug(
-        "[ARIA] readbackSupported=",
-        this.readbackSupported,
-        "sawReadData=",
-        this._sawReadData,
-      );
+
+  _channelOrder() {
+    const feat = this._featureReportIds.has(REPORT_OUT);
+    const out = this._outputReportIds.has(REPORT_OUT);
+    let order = this.transport === "bluetooth" ? ["output", "feature"] : ["feature", "output"];
+    if (feat !== out) order = order.filter((m) => (m === "feature" ? feat : out)).concat(order.filter((m) => (m === "feature" ? !feat : !out)));
+    return order;
   }
 
-  // Every field in the config block is stored as <value bytes..., chk>
-  // with chk = 0x55 - sum(value bytes). A field is only trusted when its
-  // checksum matches, so half-read or unread (0xff) memory is ignored.
+  async _probeDirectRead() {
+    this._sawReadData = false;
+    const order = this._channelOrder();
+    this.probeLog = [];
+    for (const mode of order) {
+      this._outMode = mode;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await this._enqueue(() => this.sendRaw16(this.buildWakeupPacket()));
+        } catch (e) {
+          this.probeLog.push(`${mode}: send failed (${e?.name || e})`);
+          break;
+        }
+        await sleepMs(this._t(60));
+        try {
+          await this._enqueue(() => this._readChunk(MEM_BASE, 1, this._t(700)));
+          this.readbackSupported = true;
+          this.probeLog.push(`${mode}: answered`);
+          if (this.debug) console.debug("[ARIA] channel", mode, "answers");
+          return;
+        } catch {
+          this.probeLog.push(`${mode}: no answer (try ${attempt + 1})`);
+        }
+      }
+    }
+    this._outMode = order[0];
+    this.readbackSupported = this._sawReadData ? true : false;
+    if (this.debug) console.debug("[ARIA] no channel answered", this.probeLog);
+  }
+
+
   _field(addr, n) {
     const v = [];
     let sum = 0;
@@ -748,9 +864,7 @@ class AriaHID {
     return chk === ((0x55 - sum) & 0xff) ? v : null;
   }
 
-  // DPI slot: lo, lo, hiBits, chk. raw = lo | hi<<8, DPI = (raw+1)*50.
-  // hiBits carries the high part for X in bits 2-3 and Y in bits 6-7
-  // (verified: 26000 DPI = 07 07 88 bf).
+
   static encodeDPI(dpi) {
     const raw = Math.max(0, Math.min(519, Math.round(dpi / 50) - 1));
     const lo = raw & 0xff,
@@ -824,8 +938,7 @@ class AriaHID {
     }
 
     app.onConnected();
-    // Re-rendering kills an in-progress slider drag, so only do it when
-    // something actually changed.
+
     if (JSON.stringify(s) !== before) {
       app.syncUIFromState();
       app.saveProfile();
@@ -833,8 +946,9 @@ class AriaHID {
   }
 
   onInputReport(event) {
-    const data = event.data,
-      bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const data = event.data;
+    let bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (!event.reportId && bytes.length === 17 && bytes[0] === REPORT_IN) bytes = bytes.subarray(1);
     this._lastRxReportId = event.reportId;
     this._logRx(event.reportId, bytes);
 
@@ -842,7 +956,8 @@ class AriaHID {
     if (bytes[0] === 0x04 && data.byteLength >= 6) {
       const pct = bytes[4] === 0x02 ? bytes[5] : bytes[4];
       if (pct >= 0 && pct <= 100) {
-        this._lastBatteryAt = Date.now();
+        this.lastBatteryAt = Date.now();
+        this.lastBattery = pct;
         app.updateBattery(pct);
       }
       return;
@@ -893,8 +1008,6 @@ class AriaHID {
       return;
     }
 
-    // Some firmwares only ACK via inputreport and expose data via
-    // GET_FEATURE instead; try that path before giving up.
     if (bytes[1] === 0x01 && this._pendingRead.has(address)) {
       void this._tryReceiveFeatureForRead(address, len);
     }
@@ -975,7 +1088,6 @@ class AriaHID {
         if (!this._pendingRead.has(key)) break;
       }
     } catch (e) {
-      // Some devices don't support GET_FEATURE on this report; ignore.
       if (this.debug)
         console.warn("[ARIA] receiveFeatureReport failed:", e);
     } finally {
@@ -987,12 +1099,12 @@ class AriaHID {
     return this.device && this.device.opened;
   }
 
-  // Raw send. payload = 16-byte body (report id is sent as the
-  // WebHID reportId argument, NOT inside the payload).
+ 
   async sendRaw16(payload) {
     if (!this.device || !this.device.opened) return;
     this._lastTx = Date.now();
     this._logTx("out", payload);
+    if (!this._outMode) this._outMode = this._channelOrder()[0];
     if (!this._outMode) {
       try {
         await this.device.sendFeatureReport(REPORT_OUT, payload);
@@ -1017,10 +1129,9 @@ class AriaHID {
 
   // === Direct Memory Read ===
   async readMemory(address16, length, opts = {}) {
-    // Caller puts address at big-endian hi/lo inside the frame;
-    // device answers with a 10-byte chunk at that address.
+
     const maxChunk = 10;
-    const timeoutMs = opts.timeoutMs ?? 1200;
+    const timeoutMs = opts.timeoutMs ?? this._t(1200);
     let offset = 0;
     while (offset < length) {
       const chunkLen = Math.min(maxChunk, length - offset);
@@ -1034,7 +1145,6 @@ class AriaHID {
 
   _readChunk(address16, len, timeoutMs) {
     const key = address16;
-    // Clear any stale pending read
     if (this._pendingRead.has(key)) this._pendingRead.delete(key);
 
     return new Promise(async (resolve, reject) => {
@@ -1074,11 +1184,9 @@ class AriaHID {
       { name: "buttons", addr: BTN_TABLE, len: BUTTON_SLOTS.length * 4 },
     ];
 
-    // Stop at the first timeout: if the mouse is asleep every following
-    // block would time out too.
     for (const b of blocks) {
       try {
-        await this.readMemory(b.addr, b.len, { timeoutMs: 800 });
+        await this.readMemory(b.addr, b.len, { timeoutMs: this._t(800) });
       } catch (e) {
         if (this.debug) console.warn("[ARIA] read block failed:", b.name, e);
         throw e;
@@ -1089,7 +1197,7 @@ class AriaHID {
     for (const { idx } of BUTTON_SLOTS) {
       const e = this._field(BTN_TABLE + idx * 4, 3);
       if (e && e[0] === 0x05)
-        await this.readMemory(BTN_DATA + idx * 0x20, 0x20, { timeoutMs: 800 });
+        await this.readMemory(BTN_DATA + idx * 0x20, 0x20, { timeoutMs: this._t(800) });
     }
   }
 
@@ -1151,9 +1259,7 @@ class AriaHID {
     await this.sendRaw16(buf);
   }
 
-  // Queue a write. If a write to the same register is still waiting in
-  // the queue (color picker drag, rapid clicks), just swap in the newest
-  // value so the mouse ends up on what the user last chose.
+
   sendSetting(register, dataLen, dataBytes) {
     const queued = this._pendingWrites.get(register);
     if (queued) {
@@ -1170,11 +1276,33 @@ class AriaHID {
       const pkt = this.buildPacket(0x07, register, entry.len, entry.data);
       let ok = false;
       for (let attempt = 0; attempt < 2 && !ok; attempt++) {
-        ok = await this._writeAndWaitAck(register, pkt, 400);
+        ok = await this._writeAndWaitAck(register, pkt, this._t(400));
       }
       if (!ok) throw new Error("Mouse did not confirm the change (asleep?)");
-      // Keep the local mirror in step so later diffs see the new value.
-      this._memWrite(register, entry.data.slice(0, entry.len));
+
+      const want = Array.from(entry.data.slice(0, entry.len));
+      if (this.readbackSupported) {
+        let got = null,
+          same = false;
+        for (let i = 0; i < 3 && !same; i++) {
+          await sleepMs(this._t(i ? 120 : 15));
+          try {
+            const r = await this._readChunk(register, want.length, this._t(600));
+            got = Array.from(r.payload || []);
+            same = want.every((b, k) => got[k] === b);
+          } catch {}
+        }
+        this.lastReadback = { addr: register, ok: same, sent: want, read: got };
+        if (!same)
+          throw new Error(
+            T("The mouse did not keep 0x{addr} — sent [{sent}], read [{read}]", {
+              addr: register.toString(16).padStart(4, "0"),
+              sent: this._hex(want),
+              read: got ? this._hex(got) : "—",
+            }),
+          );
+      }
+      this._memWrite(register, want);
     });
     return entry.promise;
   }
@@ -1259,6 +1387,105 @@ class AriaHID {
       );
     }
   }
+
+
+  async _readExact(addr, len, timeoutMs) {
+    const out = new Uint8Array(len);
+    for (let off = 0; off < len; off += 10) {
+      const n = Math.min(10, len - off);
+      const a = addr + off;
+      let res = null,
+        lastErr = null;
+      for (let attempt = 0; attempt < 2 && !res; attempt++) {
+        try {
+          res = await this._enqueue(() =>
+            this._readChunk(a, n, timeoutMs ?? this._t(1200)),
+          );
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (!res) throw lastErr || new Error(T("Read timeout @0x{addr}", { addr: a.toString(16) }));
+      if (!res.payload || res.payload.length < n)
+        throw new Error(
+          T("Short read at 0x{addr}: asked {want}, got {got}", {
+            addr: a.toString(16).padStart(4, "0"),
+            want: n,
+            got: res.payload ? res.payload.length : 0,
+          }),
+        );
+      out.set(res.payload.subarray(0, n), off);
+    }
+    return out;
+  }
+
+
+  async _readBytes(addr, len, onProgress) {
+    const out = new Uint8Array(len).fill(0xff);
+    for (let off = 0; off < len; off += 10) {
+      const n = Math.min(10, len - off);
+      try {
+        const res = await this._enqueue(() =>
+          this._readChunk(addr + off, n, this._t(1500)),
+        );
+        if (res?.payload) out.set(res.payload.subarray(0, n), off);
+      } catch {}
+      onProgress?.(Math.min(len, off + n), len, addr + off);
+    }
+    return out;
+  }
+
+  async writeMemory(addr, bytes, onProgress) {
+    const data = Array.from(bytes);
+    for (let off = 0; off < data.length; off += 10) {
+      const chunk = data.slice(off, off + 10);
+      const a = addr + off;
+      let ok = false,
+        read = null;
+      for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+        this._writeGen++;
+        await this._enqueue(() =>
+          this._writeAndWaitAck(a, this._frame(0x07, a, chunk.length, chunk), this._t(400)),
+        );
+        await sleepMs(this._t(12));
+        try {
+          read = Array.from(await this._readExact(a, chunk.length));
+          ok = read.every((b, i) => b === chunk[i]);
+        } catch (e) {
+          read = null;
+        }
+      }
+      this.lastReadback = { addr: a, ok, sent: chunk, read };
+      if (!ok)
+        throw new Error(
+          T("The mouse did not keep 0x{addr} — sent [{sent}], read [{read}]", {
+            addr: a.toString(16).padStart(4, "0"),
+            sent: this._hex(chunk),
+            read: read ? this._hex(read) : "—",
+          }),
+        );
+      this._memWrite(a, chunk);
+      onProgress?.(Math.min(data.length, off + 10), data.length);
+    }
+  }
+
+  async wakeup() {
+    try {
+      await this._enqueue(() => this.sendRaw16(this.buildWakeupPacket()));
+      await sleepMs(this._t(40));
+    } catch {}
+  }
+
+  async dumpMemory(onProgress) {
+    this._macroBusy = true;
+    try {
+      await this.wakeup();
+      return await this._readBytes(0x0000, MEM_SIZE, onProgress);
+    } finally {
+      this._macroBusy = false;
+    }
+  }
+
 }
 
 // ═══ App Controller ═══
@@ -1269,7 +1496,6 @@ const app = {
   _saveTimer: null,
   state: {
     stages: 7,
-    // Match defaults from Cfg.ini [DEV_1]
     dpi: [800, 1600, 2000, 2400, 3200, 5000, 26000],
     colors: [
       "#ff0000", // 255,0,0
@@ -1294,8 +1520,7 @@ const app = {
     battery: 0,
   },
 
-  // True while the user is touching a control (or just did), so the
-  // background sync never yanks a value out from under them.
+
   isUserBusy() {
     if (this._pointerDown) return true;
     if (this._pickerSlot != null) return true;
@@ -1326,40 +1551,77 @@ const app = {
   },
 
   init() {
+    this._bindStageScale();
     this._bindInteractionTracking();
     this.bindSegmented();
     this._bindProfileImport();
     this.loadSavedProfile();
     this.syncUIFromState();
+    this._updateConnectionUI();
+    document.addEventListener("aria:lang", () => {
+      this.renderButtonMap();
+      this.renderDPIStages();
+      this._updateConnectionUI();
+      if (this._pickerSlot != null) this.openButtonPicker(this._pickerSlot);
+      if (document.getElementById("diagDialog")?.open) this._renderDiagnostics();
+    });
     if (navigator.hid) {
-      // Reset UI on device disconnect
       navigator.hid.addEventListener("disconnect", (ev) => {
-        // Other HID devices (keyboard, headset...) fire this too.
         if (hid.device && ev.device !== hid.device) return;
         hid._stopTimers();
         hid._resetIO();
-        try {
-          this._isConnectedUI = false;
-          const btn = document.getElementById("btnPair");
-          btn.classList.remove("hidden");
-          btn.textContent = "Connect Device";
-          btn.disabled = false;
-          document
-            .getElementById("statusInfo")
-            .classList.remove("active");
-          document.getElementById("battRing").classList.remove("active");
-          document
-            .getElementById("panelCenter")
-            .classList.remove("connected");
-          document.getElementById("panelLeft").classList.remove("active");
-          document
-            .getElementById("panelRight")
-            .classList.remove("active");
-          this.toast("Device disconnected", "error");
-        } catch {}
+        this.onDisconnected();
+        this.toast("Device disconnected", "error");
+        hid.scheduleReconnect();
+      });
+      navigator.hid.addEventListener("connect", (ev) => {
+        if (hid.connected || ev.device?.vendorId !== VENDOR_ID) return;
+        hid.autoConnect().catch(() => {});
       });
       hid.autoConnect().catch(() => {});
     } else this.toast("WebHID not supported on this browser", "error");
+  },
+
+
+  STAGE_W: 1560,
+  STAGE_H: 940,
+  _bindStageScale() {
+    const stage = document.getElementById("stage");
+    if (!stage) return;
+    const fit = () => {
+      const s = Math.min(window.innerWidth / this.STAGE_W, window.innerHeight / this.STAGE_H);
+      document.documentElement.style.setProperty("--stage-scale", String(s));
+    };
+    fit();
+    window.addEventListener("resize", fit);
+    window.visualViewport?.addEventListener("resize", fit);
+  },
+
+  onDisconnected() {
+    this._isConnectedUI = false;
+    try {
+      const btn = document.getElementById("btnPair");
+      btn.classList.remove("hidden");
+      btn.textContent = T("Connect Device");
+      btn.disabled = false;
+      document.getElementById("statusInfo").classList.remove("active");
+      document.getElementById("battRing").classList.remove("active");
+      document.getElementById("panelCenter").classList.remove("connected");
+      document.body.classList.remove("is-connected");
+      this.closeButtonPicker();
+    } catch {}
+    this._updateConnectionUI();
+  },
+
+  _updateConnectionUI() {
+    const chip = document.getElementById("connChip");
+    if (!chip) return;
+    const on = hid.connected && this._isConnectedUI;
+    chip.classList.toggle("on", !!on);
+    chip.classList.toggle("bt", on && hid.transport === "bluetooth");
+    chip.querySelector(".conn-text").textContent = on
+      ? T("Connected over {transport}", { transport: hid.transportLabel })
+      : T("Not connected");
   },
 
   openProfileImport() {
@@ -1450,7 +1712,7 @@ const app = {
       Math.min(5, parseInt(s.speed) || this.state.speed),
     );
 
-    const known = ["mouse", "click", "fire", "dpi", "dpiLock", "rgb", "media", "key", "off"];
+    const known = ["mouse", "click", "fire", "dpi", "dpiLock", "rgb", "wheel", "media", "key", "off"];
     const valid = (b) =>
       b &&
       (known.includes(b.t) ||
@@ -1462,7 +1724,6 @@ const app = {
       valid(btns[i]) ? JSON.parse(JSON.stringify(btns[i])) : { ...def },
     );
 
-    // Never take battery from a profile
     next.battery = this.state.battery;
 
     return next;
@@ -1519,7 +1780,6 @@ const app = {
         source: "local",
       });
     } catch {
-      // Ignore corrupted storage
       this._setProfileLabel("Profile");
     }
   },
@@ -1602,26 +1862,25 @@ const app = {
 
   btnConnecting() {
     const btn = document.getElementById("btnPair");
-    btn.textContent = "Syncing...";
+    btn.textContent = T("Syncing...");
     btn.disabled = true;
   },
 
   pairFailed() {
     const btn = document.getElementById("btnPair");
-    btn.textContent = "Connect Device";
+    btn.textContent = T("Connect Device");
     btn.disabled = false;
   },
 
   onConnected() {
-    // Idempotent: avoid repeated toasts/state flips
     if (this._isConnectedUI) return;
     this._isConnectedUI = true;
     document.getElementById("btnPair").classList.add("hidden");
     document.getElementById("statusInfo").classList.add("active");
     document.getElementById("battRing").classList.add("active");
     document.getElementById("panelCenter").classList.add("connected");
-    document.getElementById("panelLeft").classList.add("active");
-    document.getElementById("panelRight").classList.add("active");
+    document.body.classList.add("is-connected");
+    this._updateConnectionUI();
     this.toast("Aria XD7 Successfully Synced", "success");
   },
 
@@ -1669,17 +1928,11 @@ const app = {
   updateBattery(pct) {
     if (pct < 0 || pct > 100) return;
     this.state.battery = pct;
-    const arc = document.getElementById("battArc"),
+    const fill = document.getElementById("battArc"),
       txt = document.getElementById("battPct");
-    const offset = 132 - (pct / 100) * 132;
-    if (arc) {
-      arc.style.strokeDashoffset = offset;
-      arc.style.stroke =
-        pct <= 20
-          ? "var(--danger)"
-          : pct <= 50
-            ? "var(--accent)"
-            : "var(--success)";
+    if (fill) {
+      fill.setAttribute("width", ((19.6 * pct) / 100).toFixed(1));
+      fill.style.fill = pct <= 20 ? "var(--danger)" : pct <= 50 ? "var(--accent)" : "var(--success)";
     }
     if (txt) txt.textContent = pct + "%";
   },
@@ -1695,44 +1948,51 @@ const app = {
       hid.setStages(next).catch((e) => this.toast(e.message, "error"));
   },
 
-  renderDPIStages() {
-    let html = "";
-    for (let i = 0; i < this.state.stages; i++) {
-      const v = this.state.dpi[i];
-      const pct = ((v - 50) / (26000 - 50)) * 100;
-      const activeDot =
-        i === 0
-          ? `style="background:${this.state.colors[i]};box-shadow:0 0 10px ${this.state.colors[i]}"`
-          : "";
-      html += `<div class="dpi-row">
-  <div class="dpi-left">
-    <div class="nav-dot ${i === 0 ? "active-stage" : ""}" ${activeDot}></div>
-    <div class="dpi-title">S ${i + 1}</div>
-  </div>
-  <button type="button" class="color-swatch" id="swatch${i}" style="background:${this.state.colors[i]}" title="LED color for stage ${i + 1}" aria-label="LED color for stage ${i + 1}" onclick="app.openColorPicker(${i})"></button>
-  <div class="stepper">
-    <button type="button" onclick="app.changeDPI(${i},-50)" aria-label="Decrease DPI stage ${i + 1}">&minus;</button>
-    <input type="number" id="dpi${i}" value="${v}" min="50" max="26000" step="50"
-      aria-label="DPI value for stage ${i + 1}"
-      onchange="app.setDPI(${i},this.value)">
-    <button type="button" onclick="app.changeDPI(${i},50)" aria-label="Increase DPI stage ${i + 1}">+</button>
-  </div>
-  <div class="dpi-slider-wrap">
-    <div class="slider-track" id="dpiTrack${i}" style="width:${pct}%"></div>
-    <input type="range" id="dpiRange${i}" min="50" max="26000" step="50" value="${v}"
-      aria-label="DPI slider for stage ${i + 1}"
-      onwheel="app.wheelDPI(event,${i})"
-      oninput="app.slideDPI(${i},this.value)"
-      onchange="app.commitDPI(${i},this.value)">
-  </div>
-</div>`;
-    }
-    this._destroyPickers();
-    document.getElementById("dpiStagesContainer").innerHTML = html;
-    this._initPickers();
+
+  _dpiSel: 0,
+  selectDPIStage(i) {
+    this._dpiSel = i;
+    this.renderDPIStages();
   },
 
-  // ── Button mapping ──────────────────────────────────
+  _updateDpiChip(i) {
+    const chip = document.getElementById("dpiChip" + i);
+    if (!chip) return;
+    chip.querySelector(".chip-val").textContent = this.state.dpi[i];
+    chip.style.setProperty("--stage-color", this.state.colors[i]);
+  },
+
+  renderDPIStages() {
+    const n = this.state.stages;
+    if (this._dpiSel >= n) this._dpiSel = n - 1;
+    const i = this._dpiSel;
+    const v = this.state.dpi[i];
+    const pct = ((v - 50) / (26000 - 50)) * 100;
+    let chips = "";
+    for (let k = 0; k < n; k++)
+      chips += `<button type="button" class="dpi-chip${k === i ? " active" : ""}" id="dpiChip${k}" style="--stage-color:${this.state.colors[k]}" onclick="app.selectDPIStage(${k})" aria-pressed="${k === i}"><span class="chip-dot"></span><span class="chip-val">${this.state.dpi[k]}</span></button>`;
+    document.getElementById("dpiStagesContainer").innerHTML = `
+      <div class="dpi-chips">${chips}</div>
+      <div class="dpi-edit">
+        <button type="button" class="color-swatch" id="swatch${i}" style="background:${this.state.colors[i]}" title="${T("LED color for stage {n}", { n: i + 1 })}" aria-label="${T("LED color for stage {n}", { n: i + 1 })}" onclick="app.openColorPicker(${i})"></button>
+        <div class="dpi-slider-wrap">
+          <div class="slider-track" id="dpiTrack${i}" style="width:${pct}%"></div>
+          <input type="range" id="dpiRange${i}" min="50" max="26000" step="50" value="${v}"
+            aria-label="${T("DPI slider for stage {n}", { n: i + 1 })}"
+            onwheel="app.wheelDPI(event,${i})"
+            oninput="app.slideDPI(${i},this.value)"
+            onchange="app.commitDPI(${i},this.value)">
+        </div>
+        <div class="stepper sm">
+          <button type="button" onclick="app.changeDPI(${i},-50)" aria-label="${T("Decrease DPI stage {n}", { n: i + 1 })}">&minus;</button>
+          <input type="number" id="dpi${i}" value="${v}" min="50" max="26000" step="50"
+            aria-label="${T("DPI value for stage {n}", { n: i + 1 })}"
+            onchange="app.setDPI(${i},this.value)">
+          <button type="button" onclick="app.changeDPI(${i},50)" aria-label="${T("Increase DPI stage {n}", { n: i + 1 })}">+</button>
+        </div>
+      </div>`;
+  },
+
   _esc(t) {
     return String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
   },
@@ -1744,20 +2004,33 @@ const app = {
     let lines = "",
       pills = "";
     for (const slot of BUTTON_SLOTS) {
-      const [ax, ay] = slot.anchor;
-      const [lx, ly] = slot.label;
       const action = this.state.buttons[slot.idx];
       const changed = !ButtonCodec.same(action, DEFAULT_BUTTONS[slot.idx]);
-      // elbow: go horizontal into the pill's row
-      const ex = slot.side === "l" ? lx + 14 : lx - 14;
-      lines += `<polyline points="${ax},${ay} ${ex},${ly} ${lx + (slot.side === "l" ? 2 : -2)},${ly}" />
-        <circle cx="${ax}" cy="${ay}" r="1.1" />`;
-      pills += `<button type="button" class="btn-pill side-${slot.side}${changed ? " changed" : ""}${this._pickerSlot === slot.idx ? " open" : ""}"
-        style="${slot.side === "l" ? "left" : "right"}:${slot.side === "l" ? lx : 100 - lx}%;top:${ly}%"
+      const cls = `${changed ? " changed" : ""}${this._pickerSlot === slot.idx ? " open" : ""}${action?.t === "macro" ? " is-macro" : ""}`;
+      const name = T(slot.name);
+      const val = ButtonCodec.label(action);
+      const [ax, ay] = slot.anchor;
+      const [lx, ly] = slot.label;
+      if (slot.side === "b") {
+        // straight down from the underside to a pill centered below the render
+        lines += `<polyline class="under" points="${ax},${ay} ${lx},${ly}" />
+          <circle cx="${ax}" cy="${ay}" r="1.1" />`;
+      } else {
+        // elbow: go horizontal into the pill's row
+        const ex = slot.side === "l" ? lx + 14 : lx - 14;
+        lines += `<polyline${slot.under ? ' class="under"' : ""} points="${ax},${ay} ${ex},${ly} ${lx + (slot.side === "l" ? 2 : -2)},${ly}" />
+          <circle cx="${ax}" cy="${ay}" r="1.1" />`;
+      }
+      const pos =
+        slot.side === "b"
+          ? `left:${lx}%;top:${ly}%`
+          : `${slot.side === "l" ? "left" : "right"}:${slot.side === "l" ? lx : 100 - lx}%;top:${ly}%`;
+      pills += `<button type="button" class="btn-pill side-${slot.side}${cls}"
+        style="${pos}"
         onclick="app.openButtonPicker(${slot.idx})"
-        aria-label="${this._esc(slot.name)}: ${this._esc(ButtonCodec.label(action))}">
-        <span class="pill-name">${this._esc(slot.name)}</span>
-        <span class="pill-val">${this._esc(ButtonCodec.label(action))}</span>
+        aria-label="${this._esc(name)}: ${this._esc(val)}">
+        <span class="pill-name">${this._esc(name)}${slot.under ? " · " + this._esc(T("underside")) : ""}</span>
+        <span class="pill-val">${this._esc(val)}</span>
       </button>`;
     }
     svg.innerHTML = lines;
@@ -1779,51 +2052,54 @@ const app = {
     const el = document.getElementById("btnPicker");
     el.innerHTML = `
       <div class="pick-head">
-        <div><div class="pick-sub">Assign button</div><div class="pick-title">${this._esc(slot.name)}</div></div>
-        <button type="button" class="pick-close" data-close aria-label="Close">&times;</button>
+        <div><div class="pick-sub">${T("Assign button")}</div><div class="pick-title">${this._esc(T(slot.name))}</div></div>
+        <button type="button" class="pick-close" data-close aria-label="${T("Close")}">&times;</button>
       </div>
       <div class="pick-body">
-        <div class="pick-group"><div class="pick-label">Mouse</div><div class="pick-chips">
+        <div class="pick-group"><div class="pick-label">${T("Mouse")}</div><div class="pick-chips">
           ${Object.keys(MOUSE_NAMES).map((v) => chip({ t: "mouse", v })).join("")}
           ${chip({ t: "click", n: 2 })}${chip({ t: "click", n: 3 })}
         </div></div>
-        <div class="pick-group"><div class="pick-label">DPI</div><div class="pick-chips">
+        <div class="pick-group"><div class="pick-label">${T("DPI")}</div><div class="pick-chips">
           ${Object.keys(DPI_FN).map((v) => chip({ t: "dpi", v })).join("")}
         </div>
           <div class="pick-row">
-            <span>DPI Lock</span>
-            <input type="number" id="pickLockDpi" min="50" max="12800" step="50" value="${lock}" aria-label="DPI lock value">
-            <button type="button" class="pick-set${cur.t === "dpiLock" ? " active" : ""}" data-set="dpiLock">Set</button>
+            <span>${T("DPI Lock")}</span>
+            <input type="number" id="pickLockDpi" min="50" max="12800" step="50" value="${lock}" aria-label="${T("DPI lock value")}">
+            <button type="button" class="pick-set${cur.t === "dpiLock" ? " active" : ""}" data-set="dpiLock">${T("Set")}</button>
           </div>
         </div>
-        <div class="pick-group"><div class="pick-label">Keyboard</div>
+        <div class="pick-group"><div class="pick-label">${T("Wheel")}</div><div class="pick-chips">
+          ${["up", "down", "left", "right"].map((v) => chip({ t: "wheel", v })).join("")}
+        </div><div class="pick-hint">${T("Wheel and tilt come from the newer CompX firmware. The mouse confirms the write; if the button does nothing, this firmware does not support it.")}</div></div>
+        <div class="pick-group"><div class="pick-label">${T("Keyboard")}</div>
           <div class="pick-row">
-            <input type="text" id="pickKey" class="pick-capture" readonly placeholder="Click here, then press keys"
-              value="${cur.t === "key" ? this._esc(ButtonCodec.label(cur)) : ""}" aria-label="Key combination">
-            <button type="button" class="pick-set${cur.t === "key" ? " active" : ""}" data-set="key">Set</button>
+            <input type="text" id="pickKey" class="pick-capture" readonly placeholder="${T("Click here, then press keys")}"
+              value="${cur.t === "key" ? this._esc(ButtonCodec.label(cur)) : ""}" aria-label="${T("Key combination")}">
+            <button type="button" class="pick-set${cur.t === "key" ? " active" : ""}" data-set="key">${T("Set")}</button>
           </div>
         </div>
-        <div class="pick-group"><div class="pick-label">Media</div>
+        <div class="pick-group"><div class="pick-label">${T("Media")}</div>
           <div class="pick-row">
-            <select id="pickMedia" aria-label="Media function">
-              ${MEDIA_KEYS.map(([u, n]) => `<option value="${u}"${u === media ? " selected" : ""}>${n}</option>`).join("")}
+            <select id="pickMedia" aria-label="${T("Media function")}">
+              ${MEDIA_KEYS.map(([u, n]) => `<option value="${u}"${u === media ? " selected" : ""}>${T(n)}</option>`).join("")}
             </select>
-            <button type="button" class="pick-set${cur.t === "media" ? " active" : ""}" data-set="media">Set</button>
+            <button type="button" class="pick-set${cur.t === "media" ? " active" : ""}" data-set="media">${T("Set")}</button>
           </div>
         </div>
-        <div class="pick-group"><div class="pick-label">Fire Key (auto click)</div>
+        <div class="pick-group"><div class="pick-label">${T("Fire Key (auto click)")}</div>
           <div class="pick-row">
-            <span>Speed</span><input type="number" id="pickFireSpeed" min="3" max="255" value="${fire.speed}" aria-label="Fire speed 3 to 255">
-            <span>Times</span><input type="number" id="pickFireTimes" min="0" max="3" value="${fire.times}" aria-label="Fire times 0 to 3">
-            <button type="button" class="pick-set${cur.t === "fire" ? " active" : ""}" data-set="fire">Set</button>
+            <span>${T("Speed")}</span><input type="number" id="pickFireSpeed" min="3" max="255" value="${fire.speed}" aria-label="${T("Fire speed 3 to 255")}">
+            <span>${T("Times")}</span><input type="number" id="pickFireTimes" min="0" max="3" value="${fire.times}" aria-label="${T("Fire times 0 to 3")}">
+            <button type="button" class="pick-set${cur.t === "fire" ? " active" : ""}" data-set="fire">${T("Set")}</button>
           </div>
         </div>
-        <div class="pick-group"><div class="pick-label">Other</div><div class="pick-chips">
+        <div class="pick-group"><div class="pick-label">${T("Other")}</div><div class="pick-chips">
           ${chip({ t: "rgb", v: "toggle" })}${chip({ t: "rgb", v: "cycle" })}${chip({ t: "off" })}
         </div></div>
       </div>
       <div class="pick-foot">
-        <button type="button" class="pick-reset" data-action='${this._esc(JSON.stringify(DEFAULT_BUTTONS[idx]))}'>Reset to default (${this._esc(ButtonCodec.label(DEFAULT_BUTTONS[idx]))})</button>
+        <button type="button" class="pick-reset" data-action='${this._esc(JSON.stringify(DEFAULT_BUTTONS[idx]))}'>${T("Reset to default")} (${this._esc(ButtonCodec.label(DEFAULT_BUTTONS[idx]))})</button>
       </div>`;
     el.hidden = false;
     this._bindPicker(el, idx);
@@ -1878,7 +2154,7 @@ const app = {
         (e.metaKey ? MOD_BITS.win : 0);
       const key = HID_KEYS[e.code] || 0;
       if (!key && !/^(Control|Shift|Alt|Meta|OS)/.test(e.code)) {
-        cap.value = "Key not supported";
+        cap.value = T("Key not supported");
         this._pendingKey = null;
         return;
       }
@@ -1889,35 +2165,42 @@ const app = {
 
   assignButton(idx, action) {
     const next = this.state.buttons.map((b, i) => (i === idx ? action : b));
-    // Same rule as the official driver: never lose the primary click.
-    if (!next.some((b) => b.t === "mouse" && b.v === "left"))
-      return this.toast("At least one button must stay Left Click", "error");
+    if (!next.some((b) => b.t === "mouse" && b.v === "left")) {
+      this.toast("At least one button must stay Left Click", "error");
+      return false;
+    }
     this.state.buttons = next;
     this.saveProfile();
     this.closeButtonPicker();
     if (hid.connected)
-      hid
+      return hid
         .setButton(idx, action)
-        .then(() => this.toast(`${BUTTON_SLOTS[idx].name} → ${ButtonCodec.label(action)}`, "success"))
-        .catch((e) => this.toast(e.message, "error"));
+        .then(() => {
+          this.toast(`${T(BUTTON_SLOTS[idx].name)} → ${ButtonCodec.label(action)}`, "success");
+          return true;
+        })
+        .catch((e) => {
+          this.toast(e.message, "error");
+          return false;
+        });
+    return true;
   },
 
-  // Drag: update the number + track live, don't spam the mouse.
   slideDPI(stage, val) {
     const n = document.getElementById("dpi" + stage);
     if (n) n.value = val;
     const track = document.getElementById("dpiTrack" + stage);
     if (track) track.style.width = ((val - 50) / 25950) * 100 + "%";
+    const chip = document.getElementById("dpiChip" + stage);
+    if (chip) chip.querySelector(".chip-val").textContent = val;
   },
 
-  // Mouse wheel over a DPI slider: exactly one 50-DPI step per notch.
   wheelDPI(ev, stage) {
     ev.preventDefault();
     const dir = ev.deltaY < 0 || ev.deltaX > 0 ? 1 : -1;
     this.changeDPI(stage, dir * 50);
   },
 
-  // Release: send to the mouse.
   commitDPI(stage, val) {
     this.setDPI(stage, val);
   },
@@ -1942,6 +2225,7 @@ const app = {
     if (rng) rng.value = val;
     const track = document.getElementById("dpiTrack" + stage);
     if (track) track.style.width = ((val - 50) / 25950) * 100 + "%";
+    this._updateDpiChip(stage);
     if (!changed) return;
     this.saveProfile();
     if (hid.connected)
@@ -1953,6 +2237,7 @@ const app = {
   setLEDColor(stage, hex) {
     this.state.colors[stage] = hex;
     const sw = document.getElementById("swatch" + stage);
+    this._updateDpiChip(stage);
     if (sw) sw.style.background = hex;
     else {
       this.renderDPIStages();
@@ -1977,11 +2262,7 @@ const app = {
         .catch((e) => this.toast(e.message, "error"));
   },
 
-  // ── Color picker library (Pickr) ─────────────────────
-  // Uses @simonwep/pickr from CDN; falls back to the native
-  // <input type="color"> when the script did not load.
-  // One shared Pickr instance, opened on demand. The old bug created a
-  // picker per stage AND rendered the native input on top of it.
+
   _colorPicker: null,
   _colorTarget: -1,
 
@@ -2035,11 +2316,9 @@ const app = {
   },
 
   _initPickers() {
-    // kept as a no-op so older call sites stay valid; pickers are lazy now.
   },
 
   _destroyPickers() {
-    // single shared picker lives for the page lifetime; nothing to destroy.
   },
 
   bindSegmented() {
@@ -2122,9 +2401,9 @@ const app = {
   updateEffectUI() {
     const mode = this.state.ledMode;
     document.getElementById("brightnessGroup").style.display =
-      mode === 1 ? "block" : "none";
+      mode === 1 ? "" : "none";
     document.getElementById("speedGroup").style.display =
-      mode === 2 ? "block" : "none";
+      mode === 2 ? "" : "none";
   },
 
   slidePreview(el, type) {
@@ -2146,7 +2425,6 @@ const app = {
         .catch((e) => this.toast(e.message, "error"));
   },
 
-  // importDctFile intentionally removed
 
   async restoreDefaults() {
     if (!hid.connected)
@@ -2213,11 +2491,156 @@ const app = {
     }
   },
 
+  openDiagnostics() {
+    const dlg = document.getElementById("diagDialog");
+    if (!dlg) return;
+    this._renderDiagnostics();
+    if (!dlg.open) dlg.showModal();
+  },
+
+  closeDiagnostics() {
+    document.getElementById("diagDialog")?.close();
+  },
+
+  _diagRows() {
+    const d = hid.device;
+    const hex = (v, n = 4) => (typeof v === "number" ? "0x" + v.toString(16).padStart(n, "0") : "—");
+    const rb = hid.lastReadback;
+    return [
+      ["Status", hid.connected ? T("Connected") : T("Not connected")],
+      ["Transport", hid.transport ? hid.transportLabel : T("unknown")],
+      ["Interface", d ? `${d.productName || "?"} · VID ${hex(d.vendorId)} · PID ${hex(d.productId)} · usagePage ${(d.collections || []).map((c) => hex(c.usagePage)).join(", ") || "—"}` : "—"],
+      ["Write channel", hid._outMode === "feature" ? T("Feature report 0x08") : hid._outMode === "output" ? T("Output report 0x08 (BLE style)") : T("not probed yet")],
+      ["Read-back", hid.readbackSupported == null ? T("unknown") : hid.readbackSupported ? T("supported") : T("no data returned")],
+      ["Last verify", rb ? `0x${rb.addr.toString(16).padStart(4, "0")} ${rb.ok ? "OK" : "FAIL"} · sent [${hid._hex(rb.sent)}] read [${rb.read ? hid._hex(rb.read) : "—"}]` : "—"],
+      ["Last battery", hid.lastBatteryAt ? `${hid.lastBattery}% · ${new Date(hid.lastBatteryAt).toLocaleTimeString()}` : T("no answer")],
+      ["Timeout scale", "×" + hid._timeoutScale],
+      ["Channel probe", (hid.probeLog || []).join(" · ") || "—"],
+      ...BUTTON_SLOTS.map((b) => {
+        const e = hid._field(BTN_TABLE + b.idx * 4, 3);
+        return [T(b.name), e ? hid._hex(e) + " · " + ButtonCodec.label(ButtonCodec.decode(e, null)) : "—"];
+      }),
+    ];
+  },
+
+  _renderDiagnostics() {
+    const rows = document.getElementById("diagRows");
+    const cand = document.getElementById("diagCandidates");
+    if (!rows || !cand) return;
+    rows.innerHTML = this._diagRows()
+      .map(([k, v]) => `<div class="diag-k">${this._esc(T(k))}</div><div class="diag-v">${this._esc(v)}</div>`)
+      .join("");
+    const dump = document.getElementById("diagDump");
+    if (dump && !this._dumpBusy && !this._dumped) dump.textContent = T("Not dumped yet.");
+    const hex = (v) => "0x" + (v ?? 0).toString(16).padStart(4, "0");
+    cand.innerHTML = hid.candidates.length
+      ? hid.candidates
+          .map(
+            (c) =>
+              `<li class="${c.device === hid.device ? "current" : ""}"><b>${this._esc(c.name)}</b> · VID ${hex(c.vid)} PID ${hex(c.pid)} · ${c.transport} · usagePages [${c.pages.map((p) => "0x" + p.toString(16)).join(", ")}] · score ${c.score}</li>`,
+          )
+          .join("")
+      : `<li class="dim">—</li>`;
+  },
+
+  diagnosticsReport() {
+    const lines = this._diagRows().map(([k, v]) => `${k}: ${v}`);
+    lines.push("", "Candidates:");
+    for (const c of hid.candidates)
+      lines.push(`  ${c.name} vid=0x${c.vid.toString(16)} pid=0x${c.pid.toString(16)} transport=${c.transport} pages=[${c.pages.map((p) => "0x" + p.toString(16)).join(",")}] score=${c.score}`);
+    if (hid.device)
+      lines.push(
+        "", "Reports declared:",
+        ...(hid.device.collections || []).map(
+          (c) => `  page 0x${c.usagePage.toString(16)} usage 0x${(c.usage ?? 0).toString(16)} in=[${(c.inputReports || []).map((r) => r.reportId)}] out=[${(c.outputReports || []).map((r) => r.reportId)}] feat=[${(c.featureReports || []).map((r) => r.reportId)}]`,
+        ),
+      );
+    lines.push("", "Channel probe: " + ((hid.probeLog || []).join(" | ") || "—"));
+    lines.push("", "Last frames:", ...(hid.wireLog || []).map((l) => "  " + l));
+    lines.push("", "userAgent: " + navigator.userAgent);
+    return lines.join("\n");
+  },
+
+  copyDiagnostics() {
+    navigator.clipboard
+      .writeText(this.diagnosticsReport())
+      .then(() => this.toast("Diagnostics copied", "success"))
+      .catch(() => this.toast("Copy failed", "error"));
+  },
+
+  async rescanDevices() {
+    try {
+      const devices = await navigator.hid.getDevices();
+      hid._rememberCandidates(devices);
+      if (!hid.connected) await hid.autoConnect();
+    } catch {}
+    this._renderDiagnostics();
+  },
+
+  async pairAll() {
+    await hid.pair({ all: true });
+    this._renderDiagnostics();
+  },
+
+  async dumpMemory() {
+    if (!hid.connected) return this.toast("Connect the mouse first", "error");
+    const out = document.getElementById("diagDump");
+    const btn = document.getElementById("diagDumpBtn");
+    if (btn) btn.disabled = true;
+    this._dumpBusy = true;
+    try {
+      const bytes = await hid.dumpMemory((done, total, addr) => {
+        if (out)
+          out.textContent = T("Reading… {pct}% (0x{addr})", {
+            pct: Math.floor((done / total) * 100),
+            addr: addr.toString(16).padStart(4, "0"),
+          });
+      });
+      const blob = new Blob([bytes], { type: "application/octet-stream" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "aria-xd7-memory.bin";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      this._dumped = true;
+      if (out) out.textContent = "aria-xd7-memory.bin · " + bytes.length + " bytes";
+      this.toast("Memory dumped — aria-xd7-memory.bin", "success");
+    } catch (e) {
+      if (out) out.textContent = e?.message || T("Dump failed");
+      this._dumped = true;
+      this.toast("Dump failed", "error");
+    } finally {
+      this._dumpBusy = false;
+      if (btn) btn.disabled = false;
+    }
+  },
+
   _toastEl: null,
   _timer: null,
-  // One-time Linux permission helper. Browsers can't open /dev/hidraw*
-  // until a udev rule grants the logged-in user access; no web API can
-  // bypass that, so we hand the user a copy-paste one-liner instead.
+
+  showBluetoothLimit() {
+    if (document.getElementById("btLimit")) return;
+    const wrap = document.createElement("div");
+    wrap.id = "btLimit";
+    wrap.className = "setup-overlay";
+    wrap.innerHTML = `
+      <div class="setup-card" role="dialog" aria-modal="true" aria-labelledby="btLimitTitle">
+        <h3 id="btLimitTitle">${T("Settings can't be changed over Bluetooth")}</h3>
+        <p>${T("Over Bluetooth the Aria XD7 only exposes its mouse and media-key interfaces. The configuration channel that the cable and the 2.4G receiver have is not there, so no app — this one or the official driver — can read or write settings over Bluetooth.")}</p>
+        <p>${T("Settings live in the mouse itself: change them once over the USB cable or the 2.4G receiver, then switch back to Bluetooth — DPI, buttons and macros stay.")}</p>
+        <div class="setup-actions">
+          <button class="setup-btn" data-act="close">${T("OK")}</button>
+        </div>
+      </div>`;
+    wrap.addEventListener("click", (e) => {
+      if (e.target === wrap || e.target.closest("[data-act=close]")) wrap.remove();
+    });
+    document.body.appendChild(wrap);
+  },
+
+
   showLinuxSetup() {
     if (document.getElementById("linuxSetup")) return;
     const cmd =
@@ -2260,6 +2683,7 @@ const app = {
 
   toast(msg, type = "success") {
     const box = document.getElementById("toastContainer");
+    msg = this._esc(T(String(msg ?? "")));
     if (this._toastEl) {
       this._toastEl.remove();
       clearTimeout(this._timer);

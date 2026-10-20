@@ -1,6 +1,7 @@
 # Fantech Aria XD7 (Compx / Areson, VID 0x25a7) — allow the logged-in user
 # to open the hidraw nodes so WebHID (Chrome/Edge/Brave/Opera) can configure
-# the mouse. Covers wired, 2.4G dongle and Bluetooth (PID fa7b / fa7c / ...).
+# the mouse. Covers wired, 2.4G dongle (PID fa7b / fa7c) and Bluetooth (fa6c).
 KERNEL=="hidraw*", ATTRS{idVendor}=="25a7", MODE="0660", TAG+="uaccess"
-# Bluetooth / non-USB path: match on the HID id instead of USB attrs
+# Bluetooth / non-USB path: BLE HID-over-GATT shows up as
+# 0005:25A7:FA6C.xxxx (bus 0005 = Bluetooth), with no USB attrs to match on
 KERNEL=="hidraw*", KERNELS=="*:25A7:*", MODE="0660", TAG+="uaccess"
